@@ -47,7 +47,19 @@ def get_free_area_coords(map_info):
     free_coords = get_coords_from_cell_position(free_cells, map_info)
     return free_coords
 
+def get_quad_tree_box(coords, box_size):
+    min_x = coords[0] - box_size / 2
+    min_y = coords[1] - box_size / 2
+    max_x = coords[0] + box_size / 2
+    max_y = coords[1] + box_size / 2
+    min_x = np.round(min_x, 1)
+    min_y = np.round(min_y, 1)
+    max_x = np.round(max_x, 1)
+    max_y = np.round(max_y, 1)
 
+    neighbor_boundary = quads.BoundingBox(min_x, min_y, max_x, max_y)
+    return neighbor_boundary
+    
 def get_free_and_connected_map(location, map_info):
     # a binary map for free and connected areas
     free = (map_info.map == FREE).astype(float)
