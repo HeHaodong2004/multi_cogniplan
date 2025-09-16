@@ -89,6 +89,8 @@ class Agent:
         self.updating_map_info = self.get_updating_map(self.location, base=self.map_info)
         self.update_frontiers()
         self.node_manager.update_graph(self.location, self.frontier, self.updating_map_info, self.map_info)
+        
+        self.node_manager.build_key_graph(self.location, self.map_info)
 
     def update_predict_map(self):
         x_belief, mask, x_raw = self.pre_process_input()
@@ -213,21 +215,21 @@ class Agent:
     def _assemble_observation_from_shared_graph(self, robot_locations=None, global_intents=None):
         """
         节点特征顺序（逐节点拼接）——固定 11 维：
-        1) rel_xy(2)                # 相对当前节点的偏移（归一化）
-        2) utility(1)               # 归一化 utility
-        3) pred_prob(1)             # 预测 free 概率（来自 pred_mean）
-        4) known(1)                 # 是否已知（explored_sign）
-        5) guidepost(1)             # 最近 frontier 的最短路节点=1
-        6) occupancy(1)             # -1 自身，1 其他机器人，0 其它
-        7) intent_any(1)            # （新）把通信范围内队友的未来意图节点标 1
-        8) conn_frac(1)             # （新）当前与“我”可直连通信的队友占比（不含自己）
+        1) rel_xy(2)
+        2) utility(1)
+        3) pred_prob(1)
+        4) known(1)
+        5) guidepost(1)
+        6) occupancy(1)
+        7) intent_any(1)
+        8) conn_frac(1)
         """
-        all_node_coords = []
-        for n in self.node_manager.nodes_dict.__iter__():
-            all_node_coords.append(np.around(n.data.coords, 1))
-        all_node_coords = np.array(all_node_coords).reshape(-1, 2)
+        # === 1) 取“活动图”视图（稀疏关键图优先；否则原图），元素接口统一为 .coords/.utility/.neighbor_set ===
+        views = [v for v in self.node_manager.iter_active_nodes()]
 
+        all_node_coords = np.array([np.around(v.coords, 1) for v in views], dtype=float).reshape(-1, 2)
         n_nodes = all_node_coords.shape[0]
+
         if n_nodes == 0:
             node_inputs = torch.zeros((1, NODE_PADDING_SIZE, NODE_INPUT_DIM), dtype=torch.float32, device=self.device)
             node_padding_mask = torch.ones((1, 1, NODE_PADDING_SIZE), dtype=torch.int16, device=self.device)
@@ -236,23 +238,22 @@ class Agent:
             current_edge = torch.zeros((1, K_SIZE, 1), dtype=torch.long, device=self.device)
             edge_padding_mask = torch.ones((1, 1, K_SIZE), dtype=torch.int16, device=self.device)
             pack = [node_inputs, node_padding_mask, edge_mask, current_index_t, current_edge, edge_padding_mask]
-            # meta: coords, utility, guidepost(mask), explored_sign, adj, neighbor_indices
             meta = [np.zeros((0,2)), np.zeros((0,)), np.zeros((0,)), np.zeros((0,)), np.ones((0,0), dtype=int), np.zeros((0,), dtype=int)]
             return pack, meta
 
-        utility = []
+        # === 2) utility ===
+        utility = np.array([float(v.utility) for v in views], dtype=np.float32)
+
+        # === 3) 邻接矩阵 ===
         adjacent_matrix = np.ones((n_nodes, n_nodes), dtype=int)
         key_all = all_node_coords[:, 0] + 1j * all_node_coords[:, 1]
-        for i, coords in enumerate(all_node_coords):
-            nd = self.node_manager.nodes_dict.find(coords.tolist()).data
-            utility.append(nd.utility)
-            for nb in nd.neighbor_set:
-                idx = np.argwhere(key_all == (nb[0] + 1j*nb[1]))
+        for i, v in enumerate(views):
+            for nb in v.neighbor_set:
+                idx = np.argwhere(key_all == (nb[0] + 1j * nb[1]))
                 if idx.size > 0:
-                    adjacent_matrix[i, idx[0][0]] = 0
-        utility = np.array(utility, dtype=np.float32)
+                    adjacent_matrix[i, int(idx[0][0])] = 0
 
-        # ---------- 3) explored_sign（known） ----------
+        # === 4) explored_sign（known） ===
         explored_sign = []
         for coords in all_node_coords:
             cell = get_cell_position_from_coords(coords, self.map_info)
@@ -260,7 +261,7 @@ class Agent:
             explored_sign.append(1 if known else 0)
         explored_sign = np.array(explored_sign, dtype=np.float32)
 
-        # ---------- 4) pred_prob ----------
+        # === 5) pred_prob ===
         if self.pred_mean_map_info is None:
             pred_prob = np.zeros((n_nodes,), dtype=np.float32)
         else:
@@ -270,24 +271,36 @@ class Agent:
                 pred_prob.append(float(self.pred_mean_map_info.map[cell[1], cell[0]]))
             pred_prob = np.array(pred_prob, dtype=np.float32)
 
-        # ---------- 5) current_index 与邻居 ----------
-        mykey = self.location[0] + 1j * self.location[1]
+        # === 6) current_index 与邻居（鲁棒版） ===
+        # 先尝试精确匹配（含 0.1 舍入）
+        mykey = complex(round(float(self.location[0]), 1), round(float(self.location[1]), 1))
+        key_all = all_node_coords[:, 0] + 1j * all_node_coords[:, 1]
         idx_arr = np.argwhere(key_all == mykey)
-        if idx_arr.size == 0:
-            nn = self.node_manager.nodes_dict.nearest_neighbors(self.location.tolist(), 1)[0].data.coords
-            mykey = nn[0] + 1j * nn[1]
-            idx_arr = np.argwhere(key_all == mykey)
-        current_index = int(idx_arr[0][0])
 
-        curr_node = self.node_manager.nodes_dict.find(all_node_coords[current_index].tolist()).data
+        if idx_arr.size > 0:
+            current_index = int(idx_arr[0][0])
+        else:
+            # 回退1：直接在活动图上找最近的节点（不依赖 quadtree）
+            diffs = all_node_coords - np.array(self.location, dtype=float).reshape(1, 2)
+            d2 = np.einsum('ij,ij->i', diffs, diffs)  # 向量化平方距离
+            current_index = int(np.argmin(d2))
+
+        # 用视图的 neighbor_set 直接构邻居索引
         neighbor_indices = []
-        for nb in curr_node.neighbor_set:
-            idx = np.argwhere(key_all == (nb[0] + 1j*nb[1]))
-            if idx.size > 0:
-                neighbor_indices.append(int(idx[0][0]))
+        for nb in views[current_index].neighbor_set:
+            j = np.argwhere(key_all == (nb[0] + 1j * nb[1]))
+            if j.size > 0:
+                neighbor_indices.append(int(j[0][0]))
         neighbor_indices = np.unique(np.array(neighbor_indices, dtype=np.int64))
 
-        # ---------- 6) occupancy ----------
+        # 至少包含自己（避免空邻居导致下游取 index 越界）
+        if neighbor_indices.size == 0 or current_index not in neighbor_indices.tolist():
+            neighbor_indices = np.unique(
+                np.concatenate([neighbor_indices, np.array([current_index], dtype=np.int64)])
+            )
+
+
+        # === 7) occupancy ===
         occupancy = np.zeros((n_nodes,), dtype=np.float32)
         occupancy[current_index] = -1.0
         if robot_locations is not None:
@@ -296,7 +309,7 @@ class Agent:
                     continue
                 try:
                     nn = self.node_manager.nodes_dict.nearest_neighbors(pos.tolist(), 1)[0].data.coords
-                    jarr = np.argwhere(key_all == (nn[0] + 1j*nn[1]))
+                    jarr = np.argwhere(key_all == (nn[0] + 1j * nn[1]))
                     if jarr.size > 0:
                         j = int(jarr[0][0])
                         if j != current_index:
@@ -304,14 +317,13 @@ class Agent:
                 except Exception:
                     pass
 
-        # ---------- 7) intent_any ----------
+        # === 8) intent_any / conn_frac ===
         def to_key_xy(p):
             return (round(float(p[0]), 1), round(float(p[1]), 1))
 
         intent_any = np.zeros((n_nodes, 1), dtype=np.float32)
         if (global_intents is not None and isinstance(global_intents, dict)
             and robot_locations is not None and len(robot_locations) > 0):
-            # 只聚合与“我”可通信的队友
             me = np.array(self.location, dtype=float)
             visible_ids = []
             for aid, pos in enumerate(robot_locations):
@@ -322,19 +334,16 @@ class Agent:
 
             node_keys = [(round(float(c[0]), 1), round(float(c[1]), 1)) for c in all_node_coords]
             key2idx = {k: i for i, k in enumerate(node_keys)}
-
-            # 标记这些队友的前 INTENT_HORIZON 步意图
             H = int(getattr(__import__('parameter'), 'INTENT_HORIZON', 3))
             for aid in visible_ids:
                 path = global_intents.get(aid, [])
-                if not path: 
+                if not path:
                     continue
                 for p in path[:H]:
                     k = to_key_xy(p)
                     if k in key2idx:
                         intent_any[key2idx[k], 0] = 1.0
 
-        # ---------- 8) conn_frac ----------
         if robot_locations is None or len(robot_locations) <= 1:
             conn_frac_col = np.zeros((n_nodes, 1), dtype=np.float32)
         else:
@@ -349,17 +358,14 @@ class Agent:
             frac = (cnt / total) if total > 0 else 0.0
             conn_frac_col = np.full((n_nodes, 1), float(frac), dtype=np.float32)
 
-        # ---------- 9) rdv_path mask ---------- not used
         rdv_path = np.zeros((n_nodes, 1), dtype=np.float32)
+        guidepost_mask = np.zeros((n_nodes, 1), dtype=np.float32)
         if isinstance(self.rdv_path_nodes_set, set) and len(self.rdv_path_nodes_set) > 0:
             path_keys = self.rdv_path_nodes_set
             for i, c in enumerate(all_node_coords):
                 key = (round(float(c[0]), 1), round(float(c[1]), 1))
                 if key in path_keys:
                     rdv_path[i, 0] = 1.0
-
-        # ---------- 10) guidepost mask ---------- not used
-        guidepost_mask = np.zeros((n_nodes, 1), dtype=np.float32)
         if isinstance(self.guidepost_nodes_set, set) and len(self.guidepost_nodes_set) > 0:
             gp = self.guidepost_nodes_set
             for i, c in enumerate(all_node_coords):
@@ -367,7 +373,7 @@ class Agent:
                 if key in gp:
                     guidepost_mask[i, 0] = 1.0
 
-        # ---------- 11) 组装特征 ----------
+        # === 9) 组装特征 ===
         node_coords = all_node_coords
         current_node_coords = node_coords[current_index]
         rel_xy = np.concatenate(
@@ -379,7 +385,6 @@ class Agent:
         node_predprob  = pred_prob.reshape(-1, 1) / float(FREE)
         node_known     = explored_sign.reshape(-1, 1)
         node_occupancy = occupancy.reshape(-1, 1)
-        
         time_left_col  = np.full((n_nodes, 1), float(getattr(self, "time_left_norm", 0.0)), dtype=np.float32)
 
         feats = np.concatenate(
@@ -390,15 +395,15 @@ class Agent:
                 node_known,        # 1
                 guidepost_mask,    # 1
                 node_occupancy,    # 1
-                intent_any,        # 1  
-                conn_frac_col,     # 1  
+                intent_any,        # 1
+                conn_frac_col,     # 1
             ),
             axis=1
         )
         assert feats.shape[1] == NODE_INPUT_DIM, f"NODE_INPUT_DIM({NODE_INPUT_DIM}) != feats({feats.shape[1]})"
         node_inputs = torch.as_tensor(feats, dtype=torch.float32, device=self.device).unsqueeze(0)
 
-        # ---------- 12) padding 与 mask ----------
+        # === 10) padding 与 mask ===
         n_node = node_coords.shape[0]
         assert n_node < NODE_PADDING_SIZE, f"{n_node} >= {NODE_PADDING_SIZE}"
         node_inputs = torch.nn.ZeroPad2d((0, 0, 0, NODE_PADDING_SIZE - n_node))(node_inputs)
@@ -428,10 +433,10 @@ class Agent:
 
         current_index_t = torch.as_tensor([current_index], dtype=torch.long, device=self.device).reshape(1, 1, 1)
 
-        # meta: coords, utility, guidepost(mask), explored_sign, adj, neighbor_indices
         pack = [node_inputs, node_padding_mask, edge_mask, current_index_t, current_edge, edge_padding_mask]
         meta = [node_coords, utility, guidepost_mask.squeeze(1), explored_sign, adjacent_matrix, neighbor_indices]
         return pack, meta
+
 
     def get_observation(self, robot_locations=None, global_intents=None):
         pack, meta = self._assemble_observation_from_shared_graph(
