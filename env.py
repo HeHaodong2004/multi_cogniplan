@@ -83,7 +83,7 @@ class Env:
 
 
     def import_ground_truth(self, episode_index):
-        map_dir = f'maps_second' if not self.test else f'dataset/maps_eval'
+        map_dir = f'maps_small' if not self.test else f'dataset/maps_eval'
         map_list = []
         for root, _, files in os.walk(map_dir):
             for f in files:

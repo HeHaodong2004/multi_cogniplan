@@ -1,1 +1,0 @@
-Generated: attn_mean_all.png (mean over ALL layers & heads)

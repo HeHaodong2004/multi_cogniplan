@@ -221,8 +221,6 @@ class Agent:
         6) occupancy(1)             # -1 自身，1 其他机器人，0 其它
         7) intent_any(1)            # （新）把通信范围内队友的未来意图节点标 1
         8) conn_frac(1)             # （新）当前与“我”可直连通信的队友占比（不含自己）
-        9) rdv_path(1)  deleted            # rendezvous 最短路节点=1 #delete in this code for ablation study
-        10) time_left_norm(1)  deleted       # 会合紧迫度，所有节点同一常数 #delete in this code for ablation study
         """
         all_node_coords = []
         for n in self.node_manager.nodes_dict.__iter__():
@@ -351,7 +349,7 @@ class Agent:
             frac = (cnt / total) if total > 0 else 0.0
             conn_frac_col = np.full((n_nodes, 1), float(frac), dtype=np.float32)
 
-        # ---------- 9) rdv_path mask ----------
+        # ---------- 9) rdv_path mask ---------- not used
         rdv_path = np.zeros((n_nodes, 1), dtype=np.float32)
         if isinstance(self.rdv_path_nodes_set, set) and len(self.rdv_path_nodes_set) > 0:
             path_keys = self.rdv_path_nodes_set
@@ -360,7 +358,7 @@ class Agent:
                 if key in path_keys:
                     rdv_path[i, 0] = 1.0
 
-        # ---------- 10) guidepost mask ----------
+        # ---------- 10) guidepost mask ---------- not used
         guidepost_mask = np.zeros((n_nodes, 1), dtype=np.float32)
         if isinstance(self.guidepost_nodes_set, set) and len(self.guidepost_nodes_set) > 0:
             gp = self.guidepost_nodes_set
@@ -381,8 +379,7 @@ class Agent:
         node_predprob  = pred_prob.reshape(-1, 1) / float(FREE)
         node_known     = explored_sign.reshape(-1, 1)
         node_occupancy = occupancy.reshape(-1, 1)
-
-        # 常数列：会合紧迫度
+        
         time_left_col  = np.full((n_nodes, 1), float(getattr(self, "time_left_norm", 0.0)), dtype=np.float32)
 
         feats = np.concatenate(
